@@ -2,16 +2,20 @@
 import os
 import io
 import concurrent.futures
-from datetime import datetime
+from datetime import date, datetime
 from dataclasses import dataclass
 from PIL import Image, ImageOps
 import numpy as np
 import cv2
-import dlib
 from tqdm import tqdm
 import logging
 from typing import Tuple
-from immich_api import get_assets_with_person, download_asset
+from immich_api import get_assets_with_person, download_asset, get_birth_date
+from dateutil.relativedelta import relativedelta
+
+import insightface
+from insightface.model_zoo import get_model
+
 
 class TqdmLoggingHandler(logging.Handler):
     def __init__(self, level=logging.NOTSET):
@@ -49,99 +53,41 @@ class AppConfig:
     date_to: str
 
 
-def initialize_worker(landmark_model_path: str) -> None:
+def initialize_worker() -> None:
     """Initialize worker process with face predictor.
     
     Args:
         landmark_model_path: Path to the landmark model file
     """
-    global face_predictor
-    face_predictor = dlib.shape_predictor(landmark_model_path)
+    global landmark_model
+    landmark_model = get_model('buffalo_l/2d106det.onnx', download=True, download_zip=True)
+    global landmark_model_3d
+    landmark_model_3d = get_model('buffalo_l/1k3d68.onnx', download=True, download_zip=True)
 
 
-def detect_landmarks(image, face_data, face_resolution_threshold):
+def detect_landmarks(img_np, face):
     """
     Detects facial landmarks in the image, resizing if necessary for better detection.
 
     Args:
-        image (PIL.Image): The input image.
-        face_data (dict): Face metadata containing bounding box information.
-        max_landmark_size (int): Maximum size for landmark detection.
+        img_np (numpy.ndarray): The input image as a numpy array.
+        face (insightface.app.common.Face): The face object containing bounding box.
 
     Returns:
         dict or None: Dictionary containing facial landmarks in numpy arrays if successful,
                      None if face resolution is too low.
     """
-    # Get face rectangle from metadata with proper scaling
-    face_img_width = face_data.get("imageWidth")
-    face_img_height = face_data.get("imageHeight")
-    img_width, img_height = image.size
-    scale_x = img_width / face_img_width
-    scale_y = img_height / face_img_height
-    x1 = int(face_data.get("boundingBoxX1", 0) * scale_x)
-    x2 = int(face_data.get("boundingBoxX2", 0) * scale_x)
-    y1 = int(face_data.get("boundingBoxY1", 0) * scale_y)
-    y2 = int(face_data.get("boundingBoxY2", 0) * scale_y)
-    w = x2 - x1
-    h = y2 - y1
     
-    if w < face_resolution_threshold or h < face_resolution_threshold:
-        return None
-
-    # Crop the face region from the image
-    face_crop = image.crop((x1, y1, x2, y2))
-    
-    # If the cropped face is too large, resize it for better landmark detection
-    optimal_size = 256  #  optimal size for landmark detection
-    scale_factor = 1.0
-    if w > optimal_size or h > optimal_size:
-        scale_factor = optimal_size / max(w, h)
-        new_w = int(w * scale_factor)
-        new_h = int(h * scale_factor)
-        face_crop = face_crop.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        w, h = new_w, new_h
-
-    # Convert PIL Image to numpy array for OpenCV processing
-    img_np = np.array(face_crop)
-    img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-
-    # Create dlib rectangle spanning the whole cropped image
-    face_rect = dlib.rectangle(0, 0, w, h)
-
     # Detect facial landmarks
-    shape = face_predictor(img_np, face_rect)
-    if not shape:
-        return None
-
-    # Scale landmarks back to original image coordinates and adjust for face rectangle position
-    landmarks = {}
-    for i in range(68):
-        x = shape.part(i).x
-        y = shape.part(i).y
-        if scale_factor != 1.0:
-            x = int(x / scale_factor)
-            y = int(y / scale_factor)
-        # Add the face rectangle's top-left coordinates to position landmarks correctly
-        x += x1
-        y += y1
-        landmarks[i] = (x, y)
-
-    # Convert to numpy arrays for specific facial features
-    left_eye = np.array([landmarks[i] for i in range(36, 42)])
-    right_eye = np.array([landmarks[i] for i in range(42, 48)])
-    nose_tip = np.array(landmarks[30])
-    chin = np.array(landmarks[8])
-    left_mouth = np.array(landmarks[48])
-    right_mouth = np.array(landmarks[54])
+    landmarks = landmark_model.get(img_np, face)
+    
+    # Convert to numpy arrays for specific facial features. Uses same indices as dlib's 68-point model.
+    left_eye = np.array([landmarks[i] for i in [35, 41, 42, 39, 37, 36]])
+    right_eye = np.array([landmarks[i] for i in [89, 95, 96, 93, 91, 90]])
 
     return {
         'left_eye': left_eye,
-        'right_eye': right_eye,
-        'nose_tip': nose_tip,
-        'chin': chin,
-        'left_mouth': left_mouth,
-        'right_mouth': right_mouth,
-        'all_landmarks': landmarks
+        'right_eye': right_eye
     }
 
 
@@ -173,70 +119,24 @@ def check_eye_visibility(left_eye, right_eye, ear_threshold=0.2) -> bool:
     return True
 
 
-def get_head_pose(landmarks, image):
+def get_head_pose(img_np, face):
     """
-    Estimates the head pose (pitch, yaw, roll) using facial landmarks.
-    Based on https://learnopencv.com/head-pose-estimation-using-opencv-and-dlib/
+    Estimates the head pose (pitch, yaw, roll) using facial landmarks of insightface's 3D landmarks model.
 
     Args:
-        landmarks (dict): Dictionary containing facial landmarks in numpy arrays.
-        image (PIL.Image): The input image.
+        image (numpy.ndarray): The input image as a numpy array.
+        face (insightface.app.common.Face): The face object containing bounding box.
 
     Returns:
         tuple or None: (pitch, yaw, roll) in degrees if successful; otherwise None.
     """
-    # Get image size
-    img_width, img_height = image.size
-
-    image_points = np.array([
-        landmarks['nose_tip'],
-        landmarks['chin'],
-        landmarks['left_eye'][0],
-        landmarks['right_eye'][3],
-        landmarks['left_mouth'],
-        landmarks['right_mouth']
-    ], dtype="double")
-
-    model_points = np.array([
-        (0.0, 0.0, 0.0),  # Nose tip
-        (0.0, -330.0, -65.0),  # Chin
-        (-225.0, 170.0, -135.0),  # Left eye left corner
-        (225.0, 170.0, -135.0),  # Right eye right corner
-        (-150.0, -150.0, -125.0),  # Left Mouth corner
-        (150.0, -150.0, -125.0)  # Right mouth corner
-    ])
-
-    focal_length = img_width
-    center = (img_width / 2, img_height / 2)
-    camera_matrix = np.array(
-        [[focal_length, 0, center[0]],
-         [0, focal_length, center[1]],
-         [0, 0, 1]], dtype="double"
-    )
-    dist_coeffs = np.zeros((4, 1))
-    success, rotation_vector, translation_vector = cv2.solvePnP(
-        model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
-    )
-    if not success:
-        logger.info("Head pose estimation failed in solvePnP.")
-        return None
-    rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
-    proj_matrix = np.hstack((rotation_matrix, translation_vector))
-    _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(proj_matrix)
-    pitch, yaw, roll = [float(angle) for angle in euler_angles]
-
-    # Normalize angles to be between -180 and 180 degrees
-    pitch = (pitch + 180) % 360 - 180
-    yaw = (yaw + 180) % 360 - 180
-    roll = (roll + 180) % 360 - 180
-
-    # Adjust pitch to be between -90 and 90 degrees
-    if pitch > 90:
-        pitch = 180 - pitch
-    elif pitch < -90:
-        pitch = -180 - pitch
-
-    return pitch, yaw, roll
+    landmark_model_3d.get(img_np, face)
+    
+    return {
+        'pitch': face.pose[0],
+        'yaw': face.pose[1],
+        'roll': face.pose[2]
+    }
 
 
 def calculate_eye_alignment_transform(
@@ -326,13 +226,13 @@ def calculate_eye_alignment_transform(
     # Convert to 2x3 matrix for OpenCV
     return M[:2, :]
 
-def crop_and_align_face(image, face_data, resize_size, face_resolution_threshold, pose_threshold, left_eye_pos):
+def crop_and_align_face(img_np: np.ndarray, face, resize_size, pose_threshold, left_eye_pos) -> np.ndarray | None:
     """
     Aligns a face in an image by positioning the eyes at specified locations.
 
     Args:
-        image (PIL.Image): The input image.
-        face_data (dict): Face metadata containing bounding box information.
+        image (np.ndarray): The input image.
+        face (insightface.app.common.Face): The face object containing bounding box.
         resize_size (int): Size to resize the output image to.
         face_resolution_threshold (int): Minimum face resolution threshold.
         pose_threshold (float): Maximum allowed head pose deviation.
@@ -342,12 +242,8 @@ def crop_and_align_face(image, face_data, resize_size, face_resolution_threshold
         PIL.Image or None: The aligned face image if successful, None otherwise.
     """
     try:
-        # Convert image to numpy array for OpenCV processing
-        img_np = np.array(image)
-        img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-
         # Detect landmarks in the face region
-        landmarks = detect_landmarks(image, face_data, face_resolution_threshold)
+        landmarks = detect_landmarks(img_np, face)
         if not landmarks:
             logger.info("Face resolution is too low")
             return None
@@ -358,20 +254,37 @@ def crop_and_align_face(image, face_data, resize_size, face_resolution_threshold
             return None
 
         # Get head pose
-        pose = get_head_pose(landmarks, image)
+        pose = get_head_pose(img_np, face)
         if not pose:
             logger.info("Could not estimate head pose")
             return None
 
         # Check if head pose is within acceptable range
-        pitch, yaw, roll = pose
-        if  abs(yaw) > pose_threshold:
-            logger.info(f"Head pose exceeds threshold: pitch={pitch:.1f}°, yaw={yaw:.1f}°, roll={roll:.1f}°")
+        if abs(pose['yaw']) > pose_threshold or abs(pose['pitch']) > pose_threshold or abs(pose['roll']) > pose_threshold:
+            logger.info(f"Head pose exceeds threshold: pitch={pose['pitch']:.1f}°, yaw={pose['yaw']:.1f}°, roll={pose['roll']:.1f}°")
             return None
 
         # Get eye positions
         left_eye_center = np.mean(landmarks['left_eye'], axis=0)
         right_eye_center = np.mean(landmarks['right_eye'], axis=0)
+
+        if False:
+            face_img_width = face_data.get("imageWidth")
+            face_img_height = face_data.get("imageHeight")
+            img_width, img_height = image.size
+            scale_x = img_width / face_img_width
+            scale_y = img_height / face_img_height
+            x1 = int(face_data.get("boundingBoxX1", 0) * scale_x)
+            x2 = int(face_data.get("boundingBoxX2", 0) * scale_x)
+            y1 = int(face_data.get("boundingBoxY1", 0) * scale_y)
+            y2 = int(face_data.get("boundingBoxY2", 0) * scale_y)
+            img_np = cv2.rectangle(img_np, pt1=(x1, y1), pt2=(x2, y2), color=(0, 200, 0), thickness=3)
+
+            for point in landmarks['all_landmarks']:
+                img_np = cv2.circle(img_np, center=(int(point[0]), int(point[1])), radius=1, color=(200, 0, 0), thickness=3, lineType=cv2.LINE_AA)
+
+            for point in landmarks['important_landmarks']:
+                img_np = cv2.circle(img_np, center=(int(point[0]), int(point[1])), radius=1, color=(0, 200, 0), thickness=3, lineType=cv2.LINE_AA)
 
         # Calculate transformation matrix
         rotation_matrix = calculate_eye_alignment_transform(
@@ -390,18 +303,44 @@ def crop_and_align_face(image, face_data, resize_size, face_resolution_threshold
             borderMode=cv2.BORDER_REPLICATE
         )
 
-        # Convert back to PIL Image
-        aligned_face = cv2.cvtColor(aligned_face, cv2.COLOR_BGR2RGB)
-        aligned_face = Image.fromarray(aligned_face)
-
         return aligned_face
 
     except Exception as e:
-        logger.error(f"Error in crop_and_align_face: {str(e)}")
+        logger.exception(f"Error during face alignment: {e}")
         return None
 
+def add_bottom_center_text(image, text, font_scale=1.0, color=(255, 255, 255), thickness=2):
+    """
+    Add text at the bottom center of an image using OpenCV.
+    
+    Args:
+        image: Input image (numpy array)
+        text: Text to write
+        font_scale: Size of the font
+        color: Text color as BGR tuple (default: white)
+        thickness: Text thickness
+    
+    Returns:
+        Image with text added
+    """
+    # Get image dimensions
+    height, width = image.shape[:2]
+    
+    # Choose font
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    
+    # Get text size to center it properly
+    (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+    
+    # Calculate position for bottom center
+    x = (width - text_width) // 2  # Center horizontally
+    y = height - 20  # 20 pixels from bottom
+    
+    # Add text
+    return cv2.putText(image, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
 
-def process_asset_worker(asset, config: AppConfig):
+
+def process_asset_worker(asset, config: AppConfig, birth_date: date | None):
     """
     Worker function to process a single asset.
 
@@ -422,29 +361,78 @@ def process_asset_worker(asset, config: AppConfig):
         image = ImageOps.exif_transpose(image)
         image = image.convert("RGB")
     except Exception as e:
-        logger.info(f"Error processing asset {asset.get('id')}: {e}")
+        logger.exception(f"Error processing asset {asset.get('id')}: {e}")
         return None
 
     matching_person = next((p for p in asset.get('people', []) if p.get('id') == config.person_id), None)
     face_data = matching_person.get('faces', [])[0]
+
+    # Convert image to numpy array for OpenCV processing
+    img_np = np.array(image)
+    img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     
     aligned_face = crop_and_align_face(
-        image,
-        face_data,
+        img_np,
+        immich_to_insightface_face(image, face_data),
         resize_size=config.resize_size,
-        face_resolution_threshold=config.face_resolution_threshold,
         pose_threshold=config.pose_threshold,
         left_eye_pos=config.left_eye_pos
     )
-
+    
     if aligned_face is None:
         return None
 
     dt = datetime.fromisoformat(asset['fileCreatedAt'].replace("Z", "+00:00"))
+    
+    if birth_date is not None:
+        age = relativedelta(dt.date(), birth_date)
+        
+        if age.months < 1:
+            if age.weeks == 0:
+                aligned_face = add_bottom_center_text(aligned_face, "Naissance")
+            elif age.weeks == 1:
+                aligned_face = add_bottom_center_text(aligned_face, "1 semaine")
+            else:
+                aligned_face = add_bottom_center_text(aligned_face, f"{age.weeks} semaines")
+        elif age.years < 2:
+            aligned_face = add_bottom_center_text(aligned_face, f"{age.years * 12 + age.months} mois")
+        else:
+            aligned_face = add_bottom_center_text(aligned_face, f"{age.years} ans")
+        
+    # Convert back to PIL Image
+    aligned_face = cv2.cvtColor(aligned_face, cv2.COLOR_BGR2RGB)
+    aligned_face = Image.fromarray(aligned_face)
+
+
     timestamp = dt.strftime("%Y%m%d_%H%M%S")
     filename = os.path.join(config.output_folder, f"{timestamp}.jpg")
     aligned_face.save(filename)
     return filename
+
+def immich_to_insightface_face(raw_image: Image, face_data: dict) -> insightface.app.common.Face:
+    """
+    Converts Immich face metadata to an InsightFace Face object.
+
+    Args:
+        raw_image (PIL.Image): The original image.
+        face_data (dict): Face metadata from Immich API.
+
+    Returns:
+        insightface.app.common.Face: Converted Face object.
+    """
+    face_img_width = face_data.get("imageWidth")
+    face_img_height = face_data.get("imageHeight")
+    img_width, img_height = raw_image.size
+    scale_x = img_width / face_img_width
+    scale_y = img_height / face_img_height
+    x1 = int(face_data.get("boundingBoxX1") * scale_x)
+    x2 = int(face_data.get("boundingBoxX2") * scale_x)
+    y1 = int(face_data.get("boundingBoxY1") * scale_y)
+    y2 = int(face_data.get("boundingBoxY2") * scale_y)
+    
+    face = insightface.app.common.Face()
+    face.bbox = np.array([x1, y1, x2, y2], dtype=np.float32)
+    return face
 
 def process_faces(config: AppConfig, max_workers=1, progress_callback=None, cancel_flag=None):
     """
@@ -468,6 +456,9 @@ def process_faces(config: AppConfig, max_workers=1, progress_callback=None, canc
 
     assets = get_assets_with_person(config.api_key, config.base_url, config.person_id, config.date_from, config.date_to)
     logger.info(f"Found {len(assets)} assets containing the person.")
+    
+    birth_date = get_birth_date(config.api_key, config.base_url, config.person_id)
+    logger.info(f"Person's birth date: {birth_date}")
 
     total_assets = len(assets)
     if progress_callback:
@@ -475,12 +466,10 @@ def process_faces(config: AppConfig, max_workers=1, progress_callback=None, canc
     processed_files = []
     completed_count = 0
 
-    initializer_args = [config.landmark_model]
     with concurrent.futures.ProcessPoolExecutor(
             max_workers=max_workers,
-            initializer=initialize_worker,
-            initargs=initializer_args) as executor:
-        future_to_asset = {executor.submit(process_asset_worker, asset, config): asset
+            initializer=initialize_worker) as executor:
+        future_to_asset = {executor.submit(process_asset_worker, asset, config, birth_date): asset
                            for asset in assets}
         for future in tqdm(concurrent.futures.as_completed(future_to_asset), total=total_assets):
 
@@ -496,7 +485,7 @@ def process_faces(config: AppConfig, max_workers=1, progress_callback=None, canc
                 if result is not None:
                     processed_files.append(result)
             except Exception as e:
-                logger.info(f"Asset processing failed: {e}")
+                logger.exception(f"Asset processing failed: {e}")
 
             completed_count += 1
             if progress_callback:
