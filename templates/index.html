@@ -193,6 +193,11 @@
                 <small class="form-text text-muted">Width and height of the output images in pixels.</small>
             </div>
             <div class="form-group">
+                <label for="date_format">Date format:</label>
+                <input type="text" name="date_format" value="{{ request.form.date_format }}">
+                <small class="form-text text-muted">Format used to display dates on the bottom center of the output images. Check <a href="https://strftime.org/" target="_blank">strftime.org</a> for formatting options. Empty string means nothing will be displayed.</small>
+            </div>
+            <div class="form-group">
                 <label for="face_resolution_threshold">Minimum Face Resolution:</label>
                 <input type="number" step="1" name="face_resolution_threshold" value="{{ request.form.face_resolution_threshold or 128 }}">
                 <small class="form-text text-muted">Minimum width/height of detected faces in pixels.</small>

@@ -165,6 +165,7 @@ def index() -> str:
             config.pose_threshold = float(request.form.get("pose_threshold"))
             config.date_from = request.form.get("date_from")
             config.date_to = request.form.get("date_to")
+            config.date_format = request.form.get("date_format") or None
             max_workers = int(request.form.get("max_workers"))
             do_not_compile_video = request.form.get("do_not_compile_video") == "on"
             framerate = int(request.form.get("framerate", 15))

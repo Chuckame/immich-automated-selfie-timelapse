@@ -10,11 +10,10 @@ import cv2
 from tqdm import tqdm
 import logging
 from typing import Tuple
-from immich_api import get_assets_with_person, download_asset, get_birth_date
-from dateutil.relativedelta import relativedelta
+from immich_api import get_assets_with_person, download_asset
 
 import insightface
-from insightface.model_zoo import get_model, Landmark
+from insightface.model_zoo import get_model
 
 
 class TqdmLoggingHandler(logging.Handler):
@@ -57,12 +56,12 @@ def initialize_worker() -> None:
     """Initialize worker process with face predictor.
     """
     global landmark_model
-    landmark_model = Landmark(get_model('buffalo_l/2d106det.onnx', download=True, download_zip=True))
+    landmark_model = get_model('buffalo_l/2d106det.onnx', download=True, download_zip=True)
     global landmark_model_3d
-    landmark_model_3d = Landmark(get_model('buffalo_l/1k3d68.onnx', download=True, download_zip=True))
+    landmark_model_3d = get_model('buffalo_l/1k3d68.onnx', download=True, download_zip=True)
 
 
-def detect_landmarks(img_np, face):
+def detect_landmarks(img_np, face_data):
     """
     Detects facial landmarks in the image, resizing if necessary for better detection.
 
@@ -118,7 +117,7 @@ def check_eye_visibility(left_eye, right_eye, ear_threshold=0.2) -> bool:
     return True
 
 
-def get_head_pose(img_np, face):
+def get_head_pose(img_np, face_data):
     """
     Estimates the head pose (pitch, yaw, roll) using facial landmarks of insightface's 3D landmarks model.
 
@@ -227,14 +226,14 @@ def calculate_eye_alignment_transform(
     # Convert to 2x3 matrix for OpenCV
     return M[:2, :]
 
-def crop_and_align_face(img_np: np.ndarray, face_data, resize_size: int, pose_threshold: float, left_eye_pos: tuple[float, float]):
+def crop_and_align_face(img_np: np.ndarray, face_data, output_size: int, pose_threshold: float, left_eye_pos: tuple[float, float]):
     """
     Aligns a face in an image by positioning the eyes at specified locations.
 
     Args:
         image (np.ndarray): The input image.
         face_data (np.ndarray): The bounding box of the face [x1, y1, x2, y2].
-        resize_size (int): Size to resize the output image to.
+        output_size (int): Size to resize the output image to.
         face_resolution_threshold (int): Minimum face resolution threshold.
         pose_threshold (float): Maximum allowed head pose deviation.
         left_eye_pos (tuple): Desired position of the left eye in the output as percentages (x, y).
@@ -275,7 +274,7 @@ def crop_and_align_face(img_np: np.ndarray, face_data, resize_size: int, pose_th
         rotation_matrix = calculate_eye_alignment_transform(
             left_eye_center,
             right_eye_center,
-            resize_size,
+            output_size,
             left_eye_pos
         )
 
@@ -283,7 +282,7 @@ def crop_and_align_face(img_np: np.ndarray, face_data, resize_size: int, pose_th
         aligned_face = cv2.warpAffine(
             img_np,
             rotation_matrix,
-            (resize_size, resize_size),
+            (output_size, output_size),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_REPLICATE
         )
@@ -326,7 +325,7 @@ def add_bottom_center_text(image, text):
     return cv2.putText(image, text, (x, y), font, fontScale=font_scale, color=(255,255,255), thickness=thickness, lineType=cv2.LINE_AA)
 
 
-def process_asset_worker(asset, config: AppConfig, birth_date: date | None):
+def process_asset_worker(asset, config: AppConfig):
     """
     Worker function to process a single asset.
 
@@ -359,7 +358,7 @@ def process_asset_worker(asset, config: AppConfig, birth_date: date | None):
     aligned_face = crop_and_align_face(
         img_np,
         scale_detected_face(image, face_data),
-        resize_size=config.resize_size,
+        output_size=config.resize_size,
         pose_threshold=config.pose_threshold,
         left_eye_pos=config.left_eye_pos
     )
@@ -382,7 +381,7 @@ def process_asset_worker(asset, config: AppConfig, birth_date: date | None):
     aligned_face.save(filename)
     return filename
 
-def write_date_text(image: NPImage, timestamp: date, date_format: str) -> NPImage:
+def write_date_text(image: np.ndarray, timestamp: date, date_format: str) -> np.ndarray:
     """
     Adds date text to the bottom center of the image.
 
