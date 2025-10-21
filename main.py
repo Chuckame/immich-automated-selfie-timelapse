@@ -26,13 +26,13 @@ class AppConfig:
     base_url: str = os.environ.get("IMMICH_BASE_URL", "")
     person_id: str = None
     output_folder: str = "output"
-    landmark_model: str = "shape_predictor_68_face_landmarks.dat"
     resize_size: int = 512
     face_resolution_threshold: int = 80
     pose_threshold: float = 25.0
     left_eye_pos: Tuple[float, float] = (0.35, 0.4)
     date_from: str = None
     date_to: str = None
+    date_format: str | None = "%x"
 
 # Initialize Flask app
 app = Flask(__name__)

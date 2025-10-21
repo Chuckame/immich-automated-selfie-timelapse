@@ -14,7 +14,7 @@ from immich_api import get_assets_with_person, download_asset, get_birth_date
 from dateutil.relativedelta import relativedelta
 
 import insightface
-from insightface.model_zoo import get_model
+from insightface.model_zoo import get_model, Landmark
 
 
 class TqdmLoggingHandler(logging.Handler):
@@ -44,25 +44,22 @@ class AppConfig:
     base_url: str
     person_id: str
     output_folder: str
-    landmark_model: str
     resize_size: int
     face_resolution_threshold: int
     pose_threshold: float
     left_eye_pos: Tuple[float, float]
     date_from: str
     date_to: str
+    date_format: str | None
 
 
 def initialize_worker() -> None:
     """Initialize worker process with face predictor.
-    
-    Args:
-        landmark_model_path: Path to the landmark model file
     """
     global landmark_model
-    landmark_model = get_model('buffalo_l/2d106det.onnx', download=True, download_zip=True)
+    landmark_model = Landmark(get_model('buffalo_l/2d106det.onnx', download=True, download_zip=True))
     global landmark_model_3d
-    landmark_model_3d = get_model('buffalo_l/1k3d68.onnx', download=True, download_zip=True)
+    landmark_model_3d = Landmark(get_model('buffalo_l/1k3d68.onnx', download=True, download_zip=True))
 
 
 def detect_landmarks(img_np, face):
@@ -71,7 +68,7 @@ def detect_landmarks(img_np, face):
 
     Args:
         img_np (numpy.ndarray): The input image as a numpy array.
-        face (insightface.app.common.Face): The face object containing bounding box.
+        face_data (numpy.ndarray): The bounding box of the face [x1, y1, x2, y2].
 
     Returns:
         dict or None: Dictionary containing facial landmarks in numpy arrays if successful,
@@ -79,6 +76,8 @@ def detect_landmarks(img_np, face):
     """
     
     # Detect facial landmarks
+    face = insightface.app.common.Face()
+    face.bbox = face_data
     landmarks = landmark_model.get(img_np, face)
     
     # Convert to numpy arrays for specific facial features. Uses same indices as dlib's 68-point model.
@@ -130,6 +129,8 @@ def get_head_pose(img_np, face):
     Returns:
         tuple or None: (pitch, yaw, roll) in degrees if successful; otherwise None.
     """
+    face = insightface.app.common.Face()
+    face.bbox = face_data
     landmark_model_3d.get(img_np, face)
     
     return {
@@ -226,13 +227,13 @@ def calculate_eye_alignment_transform(
     # Convert to 2x3 matrix for OpenCV
     return M[:2, :]
 
-def crop_and_align_face(img_np: np.ndarray, face, resize_size, pose_threshold, left_eye_pos) -> np.ndarray | None:
+def crop_and_align_face(img_np: np.ndarray, face_data, resize_size: int, pose_threshold: float, left_eye_pos: tuple[float, float]):
     """
     Aligns a face in an image by positioning the eyes at specified locations.
 
     Args:
         image (np.ndarray): The input image.
-        face (insightface.app.common.Face): The face object containing bounding box.
+        face_data (np.ndarray): The bounding box of the face [x1, y1, x2, y2].
         resize_size (int): Size to resize the output image to.
         face_resolution_threshold (int): Minimum face resolution threshold.
         pose_threshold (float): Maximum allowed head pose deviation.
@@ -242,11 +243,13 @@ def crop_and_align_face(img_np: np.ndarray, face, resize_size, pose_threshold, l
         PIL.Image or None: The aligned face image if successful, None otherwise.
     """
     try:
+        # TODO check face resolution
+        #if not landmarks:
+        #    logger.info("Face resolution is too low")
+        #    return None
+        
         # Detect landmarks in the face region
-        landmarks = detect_landmarks(img_np, face)
-        if not landmarks:
-            logger.info("Face resolution is too low")
-            return None
+        landmarks = detect_landmarks(img_np, face_data)
 
         # Check if both eyes are visible
         if not check_eye_visibility(landmarks['left_eye'], landmarks['right_eye']):
@@ -254,7 +257,7 @@ def crop_and_align_face(img_np: np.ndarray, face, resize_size, pose_threshold, l
             return None
 
         # Get head pose
-        pose = get_head_pose(img_np, face)
+        pose = get_head_pose(img_np, face_data)
         if not pose:
             logger.info("Could not estimate head pose")
             return None
@@ -267,24 +270,6 @@ def crop_and_align_face(img_np: np.ndarray, face, resize_size, pose_threshold, l
         # Get eye positions
         left_eye_center = np.mean(landmarks['left_eye'], axis=0)
         right_eye_center = np.mean(landmarks['right_eye'], axis=0)
-
-        if False:
-            face_img_width = face_data.get("imageWidth")
-            face_img_height = face_data.get("imageHeight")
-            img_width, img_height = image.size
-            scale_x = img_width / face_img_width
-            scale_y = img_height / face_img_height
-            x1 = int(face_data.get("boundingBoxX1", 0) * scale_x)
-            x2 = int(face_data.get("boundingBoxX2", 0) * scale_x)
-            y1 = int(face_data.get("boundingBoxY1", 0) * scale_y)
-            y2 = int(face_data.get("boundingBoxY2", 0) * scale_y)
-            img_np = cv2.rectangle(img_np, pt1=(x1, y1), pt2=(x2, y2), color=(0, 200, 0), thickness=3)
-
-            for point in landmarks['all_landmarks']:
-                img_np = cv2.circle(img_np, center=(int(point[0]), int(point[1])), radius=1, color=(200, 0, 0), thickness=3, lineType=cv2.LINE_AA)
-
-            for point in landmarks['important_landmarks']:
-                img_np = cv2.circle(img_np, center=(int(point[0]), int(point[1])), radius=1, color=(0, 200, 0), thickness=3, lineType=cv2.LINE_AA)
 
         # Calculate transformation matrix
         rotation_matrix = calculate_eye_alignment_transform(
@@ -309,7 +294,7 @@ def crop_and_align_face(img_np: np.ndarray, face, resize_size, pose_threshold, l
         logger.exception(f"Error during face alignment: {e}")
         return None
 
-def add_bottom_center_text(image, text, font_scale=1.0, color=(255, 255, 255), thickness=2):
+def add_bottom_center_text(image, text):
     """
     Add text at the bottom center of an image using OpenCV.
     
@@ -326,18 +311,19 @@ def add_bottom_center_text(image, text, font_scale=1.0, color=(255, 255, 255), t
     # Get image dimensions
     height, width = image.shape[:2]
     
-    # Choose font
     font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1.0
+    thickness = 2
     
     # Get text size to center it properly
-    (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-    
+    (text_width, _), _ = cv2.getTextSize(text, font, fontScale=font_scale, thickness=thickness)
+
     # Calculate position for bottom center
     x = (width - text_width) // 2  # Center horizontally
     y = height - 20  # 20 pixels from bottom
     
     # Add text
-    return cv2.putText(image, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
+    return cv2.putText(image, text, (x, y), font, fontScale=font_scale, color=(255,255,255), thickness=thickness, lineType=cv2.LINE_AA)
 
 
 def process_asset_worker(asset, config: AppConfig, birth_date: date | None):
@@ -370,10 +356,9 @@ def process_asset_worker(asset, config: AppConfig, birth_date: date | None):
     # Convert image to numpy array for OpenCV processing
     img_np = np.array(image)
     img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-    
     aligned_face = crop_and_align_face(
         img_np,
-        immich_to_insightface_face(image, face_data),
+        scale_detected_face(image, face_data),
         resize_size=config.resize_size,
         pose_threshold=config.pose_threshold,
         left_eye_pos=config.left_eye_pos
@@ -383,22 +368,10 @@ def process_asset_worker(asset, config: AppConfig, birth_date: date | None):
         return None
 
     dt = datetime.fromisoformat(asset['fileCreatedAt'].replace("Z", "+00:00"))
-    
-    if birth_date is not None:
-        age = relativedelta(dt.date(), birth_date)
-        
-        if age.months < 1:
-            if age.weeks == 0:
-                aligned_face = add_bottom_center_text(aligned_face, "Naissance")
-            elif age.weeks == 1:
-                aligned_face = add_bottom_center_text(aligned_face, "1 semaine")
-            else:
-                aligned_face = add_bottom_center_text(aligned_face, f"{age.weeks} semaines")
-        elif age.years < 2:
-            aligned_face = add_bottom_center_text(aligned_face, f"{age.years * 12 + age.months} mois")
-        else:
-            aligned_face = add_bottom_center_text(aligned_face, f"{age.years} ans")
-        
+
+    if config.date_format:
+        aligned_face = write_date_text(aligned_face, dt.date(), config.date_format)
+
     # Convert back to PIL Image
     aligned_face = cv2.cvtColor(aligned_face, cv2.COLOR_BGR2RGB)
     aligned_face = Image.fromarray(aligned_face)
@@ -409,30 +382,41 @@ def process_asset_worker(asset, config: AppConfig, birth_date: date | None):
     aligned_face.save(filename)
     return filename
 
-def immich_to_insightface_face(raw_image: Image, face_data: dict) -> insightface.app.common.Face:
+def write_date_text(image: NPImage, timestamp: date, date_format: str) -> NPImage:
+    """
+    Adds date text to the bottom center of the image.
+
+    Args:
+        image (np.ndarray): The input image.
+        timestamp (date): The date to display.
+        date_format (str): The format string for the date.
+    """
+    text = timestamp.strftime(date_format)
+
+    return add_bottom_center_text(image, text)
+
+def scale_detected_face(raw_image: Image.Image, immich_face_data: dict[str, any]):
     """
     Converts Immich face metadata to an InsightFace Face object.
 
     Args:
         raw_image (PIL.Image): The original image.
-        face_data (dict): Face metadata from Immich API.
+        immich_face_data (dict): Face metadata from Immich API.
 
     Returns:
         insightface.app.common.Face: Converted Face object.
     """
-    face_img_width = face_data.get("imageWidth")
-    face_img_height = face_data.get("imageHeight")
+    face_img_width = int(immich_face_data.get("imageWidth"))
+    face_img_height = int(immich_face_data.get("imageHeight"))
     img_width, img_height = raw_image.size
     scale_x = img_width / face_img_width
     scale_y = img_height / face_img_height
-    x1 = int(face_data.get("boundingBoxX1") * scale_x)
-    x2 = int(face_data.get("boundingBoxX2") * scale_x)
-    y1 = int(face_data.get("boundingBoxY1") * scale_y)
-    y2 = int(face_data.get("boundingBoxY2") * scale_y)
+    x1 = int(immich_face_data.get("boundingBoxX1") * scale_x)
+    y1 = int(immich_face_data.get("boundingBoxY1") * scale_y)
+    x2 = int(immich_face_data.get("boundingBoxX2") * scale_x)
+    y2 = int(immich_face_data.get("boundingBoxY2") * scale_y)
     
-    face = insightface.app.common.Face()
-    face.bbox = np.array([x1, y1, x2, y2], dtype=np.float32)
-    return face
+    return np.array([x1, y1, x2, y2], dtype=np.int32)
 
 def process_faces(config: AppConfig, max_workers=1, progress_callback=None, cancel_flag=None):
     """
@@ -456,9 +440,6 @@ def process_faces(config: AppConfig, max_workers=1, progress_callback=None, canc
 
     assets = get_assets_with_person(config.api_key, config.base_url, config.person_id, config.date_from, config.date_to)
     logger.info(f"Found {len(assets)} assets containing the person.")
-    
-    birth_date = get_birth_date(config.api_key, config.base_url, config.person_id)
-    logger.info(f"Person's birth date: {birth_date}")
 
     total_assets = len(assets)
     if progress_callback:
@@ -469,7 +450,7 @@ def process_faces(config: AppConfig, max_workers=1, progress_callback=None, canc
     with concurrent.futures.ProcessPoolExecutor(
             max_workers=max_workers,
             initializer=initialize_worker) as executor:
-        future_to_asset = {executor.submit(process_asset_worker, asset, config, birth_date): asset
+        future_to_asset = {executor.submit(process_asset_worker, asset, config): asset
                            for asset in assets}
         for future in tqdm(concurrent.futures.as_completed(future_to_asset), total=total_assets):
 

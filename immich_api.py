@@ -1,4 +1,3 @@
-from datetime import date
 import requests
 import logging
 
@@ -8,10 +7,9 @@ logger = logging.getLogger(__name__)
 # - server.about (ping the server)
 # - asset.read (list assets)
 # - asset.download (download original image)
-# - person.read (list people, get birth date)
 
 
-def validate_immich_connection(api_key, base_url):
+def validate_immich_connection(api_key: str, base_url: str) -> tuple[bool, str]:
     """
     Validates that the provided Immich API key and base URL are working.
 
@@ -49,7 +47,7 @@ def validate_immich_connection(api_key, base_url):
         return False, f"Unexpected error: {str(e)}"
 
 
-def get_assets_with_person(api_key, base_url, person_id, date_from=None, date_to=None):
+def get_assets_with_person(api_key: str, base_url: str, person_id: str, date_from: str | None, date_to: str | None):
     """
     Retrieve all image assets containing the specified person by querying the API.
 
@@ -101,40 +99,7 @@ def get_assets_with_person(api_key, base_url, person_id, date_from=None, date_to
     return all_assets
 
 
-def get_birth_date(api_key, base_url, person_id):
-    """
-    Retrieves the birth date of a person from the API.
-
-    Args:
-        api_key (str): API key for authentication.
-        base_url (str): Base URL of the API.
-        person_id (str): ID of the person to search for.
-
-    Returns:
-        date: Birth date of the person if found, None otherwise.
-    """
-    headers = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'x-api-key': api_key,
-    }
-    url = f"{base_url}/people/{person_id}"
-
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        logger.warn(f"Error fetching birth date: {response.status_code} - {response.text}")
-        return None
-    data = response.json()
-    if not data:
-        logger.warn(f"Error fetching birth date: no body in response")
-        return None
-    birth_date_str = data['birthDate']
-    if not birth_date_str:
-        return None
-    return date.fromisoformat(birth_date_str)
-
-
-def download_asset(api_key, base_url, asset_id):
+def download_asset(api_key: str, base_url: str, asset_id: str) -> bytes:
     """
     Downloads the original image asset from the API.
 
