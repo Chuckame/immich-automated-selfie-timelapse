@@ -1,4 +1,3 @@
-# image_processing.py
 import os
 import io
 import concurrent.futures
@@ -9,8 +8,8 @@ import numpy as np
 import cv2
 from tqdm import tqdm
 import logging
-from typing import Tuple
-from immich_api import get_assets_with_person, download_asset
+from typing import Callable, Tuple
+from immich_api import ImmichAsset, ImmichPersonFace, get_assets_with_person, download_asset
 
 import insightface
 from insightface.model_zoo import get_model
@@ -37,18 +36,18 @@ logger.addHandler(tqdm_handler)
 
 
 @dataclass
-class AppConfig:
+class ProcessConfig:
     """Configuration for the application."""
     api_key: str
     base_url: str
-    person_id: str
     output_folder: str
-    resize_size: int
+    person_id: str
+    output_image_size: int
     face_resolution_threshold: int
-    pose_threshold: float
+    pose_threshold: int
     left_eye_pos: Tuple[float, float]
-    date_from: str
-    date_to: str
+    date_from: str | None
+    date_to: str | None
     date_format: str | None
 
 
@@ -142,7 +141,7 @@ def get_head_pose(img_np, face_data):
 def calculate_eye_alignment_transform(
     left_eye_center: np.ndarray,
     right_eye_center: np.ndarray,
-    output_size: int,
+    output_image_size: int,
     desired_left_eye_pos: Tuple[float, float]
 ) -> np.ndarray:
     """Calculate the transformation matrix to align eyes at desired positions.
@@ -150,7 +149,7 @@ def calculate_eye_alignment_transform(
     Args:
         left_eye_center: Center coordinates of the left eye
         right_eye_center: Center coordinates of the right eye
-        output_size: Size of the output image (width and height)
+        output_image_size: Size of the output image (width and height)
         desired_left_eye_pos: Desired position of left eye as percentages (x, y)
         
     Returns:
@@ -158,12 +157,12 @@ def calculate_eye_alignment_transform(
     """
     # Calculate the desired eye positions in the output image
     left_eye_target = np.array([
-        output_size * desired_left_eye_pos[0],
-        output_size * desired_left_eye_pos[1]
+        output_image_size * desired_left_eye_pos[0],
+        output_image_size * desired_left_eye_pos[1]
     ])
     right_eye_target = np.array([
-        output_size * (1.0 - desired_left_eye_pos[0]),
-        output_size * desired_left_eye_pos[1]
+        output_image_size * (1.0 - desired_left_eye_pos[0]),
+        output_image_size * desired_left_eye_pos[1]
     ])
 
     # Calculate the angle between the current eye line and the target eye line
@@ -226,14 +225,14 @@ def calculate_eye_alignment_transform(
     # Convert to 2x3 matrix for OpenCV
     return M[:2, :]
 
-def crop_and_align_face(img_np: np.ndarray, face_data, output_size: int, pose_threshold: float, left_eye_pos: tuple[float, float]):
+def crop_and_align_face(img_np: np.ndarray, face_data, output_image_size: int, pose_threshold: float, left_eye_pos: tuple[float, float]):
     """
     Aligns a face in an image by positioning the eyes at specified locations.
 
     Args:
         image (np.ndarray): The input image.
         face_data (np.ndarray): The bounding box of the face [x1, y1, x2, y2].
-        output_size (int): Size to resize the output image to.
+        output_image_size (int): Size to resize the output image to.
         face_resolution_threshold (int): Minimum face resolution threshold.
         pose_threshold (float): Maximum allowed head pose deviation.
         left_eye_pos (tuple): Desired position of the left eye in the output as percentages (x, y).
@@ -274,7 +273,7 @@ def crop_and_align_face(img_np: np.ndarray, face_data, output_size: int, pose_th
         rotation_matrix = calculate_eye_alignment_transform(
             left_eye_center,
             right_eye_center,
-            output_size,
+            output_image_size,
             left_eye_pos
         )
 
@@ -282,7 +281,7 @@ def crop_and_align_face(img_np: np.ndarray, face_data, output_size: int, pose_th
         aligned_face = cv2.warpAffine(
             img_np,
             rotation_matrix,
-            (output_size, output_size),
+            (output_image_size, output_image_size),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_REPLICATE
         )
@@ -300,9 +299,6 @@ def add_bottom_center_text(image, text):
     Args:
         image: Input image (numpy array)
         text: Text to write
-        font_scale: Size of the font
-        color: Text color as BGR tuple (default: white)
-        thickness: Text thickness
     
     Returns:
         Image with text added
@@ -325,7 +321,7 @@ def add_bottom_center_text(image, text):
     return cv2.putText(image, text, (x, y), font, fontScale=font_scale, color=(255,255,255), thickness=thickness, lineType=cv2.LINE_AA)
 
 
-def process_asset_worker(asset, config: AppConfig):
+def process_asset_worker(asset: ImmichAsset, config: ProcessConfig) -> str | None:
     """
     Worker function to process a single asset.
 
@@ -334,31 +330,34 @@ def process_asset_worker(asset, config: AppConfig):
 
     Args:
         asset (dict): The asset metadata.
-        config (AppConfig): Configuration parameters.
+        config (ProcessConfig): Configuration parameters.
 
     Returns:
         str or None: The file path of the saved image if processing is successful; otherwise None.
     """
     try:
-        asset_id = asset['id']
-        image_bytes = download_asset(config.api_key, config.base_url, asset_id)
+        image_bytes = download_asset(config.api_key, config.base_url, asset.id)
         image = Image.open(io.BytesIO(image_bytes))
         image = ImageOps.exif_transpose(image)
         image = image.convert("RGB")
     except Exception as e:
-        logger.exception(f"Error processing asset {asset.get('id')}: {e}")
+        logger.exception(f"Error processing asset {asset.id}: {e}")
         return None
 
-    matching_person = next((p for p in asset.get('people', []) if p.get('id') == config.person_id), None)
-    face_data = matching_person.get('faces', [])[0]
-
+    matching_person = next((p for p in asset.people if p.id == config.person_id), None)
+    face_data = matching_person.faces[0] if matching_person else None
+    
+    if not face_data:
+        logger.warning(f"No face data found for person {config.person_id} in asset {asset.id}")
+        return None
+    
     # Convert image to numpy array for OpenCV processing
     img_np = np.array(image)
     img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     aligned_face = crop_and_align_face(
         img_np,
         scale_detected_face(image, face_data),
-        output_size=config.resize_size,
+        output_image_size=config.output_image_size,
         pose_threshold=config.pose_threshold,
         left_eye_pos=config.left_eye_pos
     )
@@ -394,7 +393,7 @@ def write_date_text(image: np.ndarray, timestamp: date, date_format: str) -> np.
 
     return add_bottom_center_text(image, text)
 
-def scale_detected_face(raw_image: Image.Image, immich_face_data: dict[str, any]):
+def scale_detected_face(raw_image: Image.Image, immich_face_data: ImmichPersonFace):
     """
     Converts Immich face metadata to an InsightFace Face object.
 
@@ -405,19 +404,19 @@ def scale_detected_face(raw_image: Image.Image, immich_face_data: dict[str, any]
     Returns:
         insightface.app.common.Face: Converted Face object.
     """
-    face_img_width = int(immich_face_data.get("imageWidth"))
-    face_img_height = int(immich_face_data.get("imageHeight"))
+    face_img_width = int(immich_face_data.imageWidth)
+    face_img_height = int(immich_face_data.imageHeight)
     img_width, img_height = raw_image.size
     scale_x = img_width / face_img_width
     scale_y = img_height / face_img_height
-    x1 = int(immich_face_data.get("boundingBoxX1") * scale_x)
-    y1 = int(immich_face_data.get("boundingBoxY1") * scale_y)
-    x2 = int(immich_face_data.get("boundingBoxX2") * scale_x)
-    y2 = int(immich_face_data.get("boundingBoxY2") * scale_y)
-    
-    return np.array([x1, y1, x2, y2], dtype=np.int32)
+    x1 = immich_face_data.boundingBoxX1 * scale_x
+    y1 = immich_face_data.boundingBoxY1 * scale_y
+    x2 = immich_face_data.boundingBoxX2 * scale_x
+    y2 = immich_face_data.boundingBoxY2 * scale_y
 
-def process_faces(config: AppConfig, max_workers=1, progress_callback=None, cancel_flag=None):
+    return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+def process_faces(config: ProcessConfig, max_workers: int, progress_callback: Callable[[int, int], None], cancel_flag: Callable[[], bool]) -> list[str]:
     """
     Processes assets containing the person and saves aligned face images.
 
@@ -425,7 +424,7 @@ def process_faces(config: AppConfig, max_workers=1, progress_callback=None, canc
     concurrently download, crop, and align faces.
 
     Args:
-        config (AppConfig): Configuration parameters.
+        config (ProcessConfig): Configuration parameters.
         max_workers (int): Number of worker processes.
         progress_callback (callable, optional): A callback function for progress updates.
         cancel_flag (callable, optional): A function that returns True if processing should be cancelled.
@@ -433,7 +432,7 @@ def process_faces(config: AppConfig, max_workers=1, progress_callback=None, canc
     Returns:
         list: A list of file paths of the saved images.
     """
-    if cancel_flag and cancel_flag():
+    if cancel_flag():
         logger.info("Processing was cancelled.")
         return []
 
@@ -441,9 +440,8 @@ def process_faces(config: AppConfig, max_workers=1, progress_callback=None, canc
     logger.info(f"Found {len(assets)} assets containing the person.")
 
     total_assets = len(assets)
-    if progress_callback:
-        progress_callback(0, total_assets)
-    processed_files = []
+    progress_callback(0, total_assets)
+    processed_files: list[str] = []
     completed_count = 0
 
     with concurrent.futures.ProcessPoolExecutor(
@@ -453,7 +451,7 @@ def process_faces(config: AppConfig, max_workers=1, progress_callback=None, canc
                            for asset in assets}
         for future in tqdm(concurrent.futures.as_completed(future_to_asset), total=total_assets):
 
-            if cancel_flag and cancel_flag():
+            if cancel_flag():
                 logger.info("Processing was cancelled.")
                 for f in future_to_asset:
                     f.cancel()
@@ -468,8 +466,7 @@ def process_faces(config: AppConfig, max_workers=1, progress_callback=None, canc
                 logger.exception(f"Asset processing failed: {e}")
 
             completed_count += 1
-            if progress_callback:
-                progress_callback(completed_count, total_assets)
+            progress_callback(completed_count, total_assets)
 
     logger.info(f"Finished processing. {len(processed_files)} images saved out of {total_assets} assets.")
     return processed_files

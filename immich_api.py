@@ -1,5 +1,16 @@
+
+from dataclasses import dataclass
+from datetime import date, datetime
+from uuid import UUID
 import requests
 import logging
+from immich_client import AuthenticatedClient
+
+from immich_client.api.search import search_assets
+from immich_client.models.asset_response_dto import AssetResponseDto
+from immich_client.models.asset_type_enum import AssetTypeEnum
+from immich_client.models.asset_visibility import AssetVisibility
+from immich_client.models.metadata_search_dto import MetadataSearchDto
 
 logger = logging.getLogger(__name__)
 
@@ -9,7 +20,12 @@ logger = logging.getLogger(__name__)
 # - asset.download (download original image)
 
 
-def validate_immich_connection(api_key: str, base_url: str) -> tuple[bool, str]:
+@dataclass(frozen=True)
+class ImmichConnectionInfo:
+    is_success: bool
+    error_message: str | None
+
+def validate_immich_connection(api_key: str, base_url: str) -> ImmichConnectionInfo:
     """
     Validates that the provided Immich API key and base URL are working.
 
@@ -21,7 +37,7 @@ def validate_immich_connection(api_key: str, base_url: str) -> tuple[bool, str]:
         tuple: (bool, str) - (is_valid, error_message)
     """
     if not api_key or not base_url:
-        return False, "API key and base URL are required."
+        return ImmichConnectionInfo(is_success=False, error_message="API key and base URL are required.")
 
     try:
         headers = {
@@ -33,21 +49,22 @@ def validate_immich_connection(api_key: str, base_url: str) -> tuple[bool, str]:
         response = requests.get(url, headers=headers, timeout=5)
 
         if response.status_code == 200:
-            return True, "Connection successful."
+            return ImmichConnectionInfo(is_success=True, error_message=None)
         elif response.status_code == 401:
-            return False, "Authentication failed. Invalid API key."
+            return ImmichConnectionInfo(is_success=False, error_message="Authentication failed. Invalid API key.")
         else:
-            return False, f"Server error: Status code {response.status_code}"
+            return ImmichConnectionInfo(is_success=False, error_message=f"Server error: Status code {response.status_code}")
 
     except requests.exceptions.ConnectionError:
-        return False, "Connection error. Check the base URL."
+        return ImmichConnectionInfo(is_success=False, error_message="Connection error. Check the base URL.")
     except requests.exceptions.Timeout:
-        return False, "Connection timed out. Server might be down."
+        return ImmichConnectionInfo(is_success=False, error_message="Connection timed out. Server might be down.")
     except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
+        return ImmichConnectionInfo(is_success=False, error_message=f"Unexpected error: {str(e)}")
+ 
 
 
-def get_assets_with_person(api_key: str, base_url: str, person_id: str, date_from: str | None, date_to: str | None):
+def get_assets_with_person(api_key: str, base_url: str, person_id: UUID, date_from: date | None, date_to: date | None) -> list[AssetResponseDto]:
     """
     Retrieve all image assets containing the specified person by querying the API.
 
@@ -61,43 +78,38 @@ def get_assets_with_person(api_key: str, base_url: str, person_id: str, date_fro
     Returns:
         list: List of asset dictionaries.
     """
-    headers = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'x-api-key': api_key,
-    }
-    url = f"{base_url}/search/metadata"
-    all_assets = []
-    payload = {
-        "page": 1,
-        "type": "IMAGE",
-        "personIds": [person_id],
-        "visibility": "timeline",
-        "withDeleted": False,
-        "withExif": True,
-        "withPeople": True,
-        "withStacked": True,
-    }
+    payload = MetadataSearchDto(
+        page=1,
+        type_=AssetTypeEnum.IMAGE,
+        person_ids=[person_id],
+        visibility=AssetVisibility.TIMELINE,
+        with_deleted=False,
+        with_exif=True,
+        with_people=True,
+        with_stacked=True,
+    )
 
     if date_from:
-        payload["takenAfter"] = f"{date_from}T00:00:00.000Z"
+        payload.taken_after = datetime.combine(date_from, datetime.min.time())
 
     if date_to:
-        payload["takenBefore"] = f"{date_to}T23:59:59.999Z"
+        payload.taken_before = datetime.combine(date_to, datetime.max.time())
 
-    while payload["page"] is not None:
-        response = requests.post(url, headers=headers, json=payload)
+    client = AuthenticatedClient(base_url=base_url, token=api_key)
+    
+
+    all_assets: list[AssetResponseDto] = []
+    while payload.page:
+        response = search_assets.sync_detailed(client=client, body=payload)
         if response.status_code != 200:
-            logger.info(f"Error fetching page {payload['page']}: {response.status_code} - {response.text}")
+            logger.info(f"Error fetching page {payload.page}: {response.status_code} - {str(response.content)}")
             break
-        data = response.json()
-        if not data:
+        if not response.parsed:
             break
-        all_assets.extend(data['assets']['items'])
-        logger.info(f"Fetched page {payload['page']} with {len(data['assets']['items'])} assets")
-        payload["page"] = data['assets'].get('nextPage')
+        all_assets.extend(response.parsed.assets.items)
+        logger.info(f"Fetched page {payload.page} with {len(response.parsed['assets']['items'])} assets")
+        payload.page = response.parsed['assets'].get('nextPage')
     return all_assets
-
 
 def download_asset(api_key: str, base_url: str, asset_id: str) -> bytes:
     """
